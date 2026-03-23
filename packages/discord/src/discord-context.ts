@@ -184,6 +184,16 @@ export function createDiscordContext(triggerMessage: Message, _workingDir: strin
 		respondInThread: async (text: string): Promise<void> => {
 			updatePromise = updatePromise.then(async () => {
 				try {
+					// DMs don't support threads — fall back to regular messages
+					if (triggerMessage.channel.isDMBased()) {
+						const chunks = splitMessage(text);
+						for (const chunk of chunks) {
+							const msg = await channel.send(chunk);
+							threadMessages.push(msg);
+						}
+						return;
+					}
+
 					if (!thread) {
 						// Create a thread on the trigger message
 						if ("startThread" in triggerMessage && botMessage) {

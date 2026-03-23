@@ -3,6 +3,7 @@ import {
 	GatewayIntentBits,
 	type Interaction,
 	type Message,
+	Partials,
 	REST,
 	Routes,
 	SlashCommandBuilder,
@@ -88,6 +89,7 @@ export class DiscordBot {
 				GatewayIntentBits.MessageContent,
 				GatewayIntentBits.DirectMessages,
 			],
+			partials: [Partials.Channel, Partials.Message],
 		});
 	}
 

@@ -1,5 +1,5 @@
 import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
-import { getModel, getModels, type ImageContent, type KnownProvider, type Model } from "@mariozechner/pi-ai";
+import { getModel, type ImageContent, type Model } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -294,18 +294,6 @@ export interface AgentRunner {
 	abort(): void;
 }
 
-async function getAnthropicApiKey(authStorage: AuthStorage): Promise<string> {
-	const key = await authStorage.getApiKey("anthropic");
-	if (!key) {
-		throw new Error(
-			"No API key found for anthropic.\n\n" +
-				"Set an API key environment variable, or use /login with Anthropic and link to auth.json from " +
-				join(homedir(), ".pi", "discord", "auth.json"),
-		);
-	}
-	return key;
-}
-
 // Cache runners per channel
 const channelRunners = new Map<string, AgentRunner>();
 
@@ -361,12 +349,11 @@ function createRunner(config: DiscordConfig, channelId: string, channelDir: stri
 	const authStorage = AuthStorage.create(join(homedir(), ".pi", "discord", "auth.json"));
 	const modelRegistry = new ModelRegistry(authStorage);
 
-	// Resolve model from registry — we use getModels to find by id since model id comes from config
-	const provider = config.model.primary.api as KnownProvider;
+	// Resolve model from registry (includes custom models.json)
+	const provider = config.model.primary.api;
 	const modelId = config.model.primary.id;
-	const allModels = getModels(provider);
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const model: Model<any> = allModels.find((m) => m.id === modelId) ?? getModel("anthropic", "claude-sonnet-4-5");
+	const model: Model<any> = modelRegistry.find(provider, modelId) ?? getModel("anthropic", "claude-sonnet-4-5");
 
 	const contextFile = join(channelDir, "context.jsonl");
 	const sessionManager = SessionManager.open(contextFile, channelDir);
@@ -379,8 +366,25 @@ function createRunner(config: DiscordConfig, channelId: string, channelDir: stri
 			thinkingLevel: "off",
 			tools,
 		},
-		convertToLlm,
-		getApiKey: async () => getAnthropicApiKey(authStorage),
+		convertToLlm: (messages) => {
+			// Wrap convertToLlm to flatten text-only content arrays to plain strings.
+			// OpenAI-compatible proxies (like the local Claude proxy) may not handle
+			// content: [{type: "text", text: "..."}] — they need content: "string".
+			const converted = convertToLlm(messages);
+			return converted.map((msg) => {
+				if (msg.role === "user" && Array.isArray(msg.content)) {
+					const allText = (msg.content as any[]).every((c) => c.type === "text");
+					if (allText) {
+						return { ...msg, content: (msg.content as any[]).map((c) => c.text).join("\n") };
+					}
+				}
+				return msg;
+			});
+		},
+		getApiKey: async (providerName?: string) => {
+			// AuthStorage has a fallback resolver from ModelRegistry for custom provider keys (models.json)
+			return authStorage.getApiKey(providerName ?? provider);
+		},
 	});
 
 	// Load existing messages
