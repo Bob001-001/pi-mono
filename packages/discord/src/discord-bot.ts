@@ -197,9 +197,11 @@ export class DiscordBot {
 	}
 
 	private async handleMessageCreate(message: Message): Promise<void> {
-		// Ignore bots (including self)
-		if (message.author.bot) return;
+		if (!this.botUserId) return;
+		// Ignore own messages
 		if (message.author.id === this.botUserId) return;
+		// Ignore bots unless they're in the allowlist (e.g. Sentry alert bot)
+		if (message.author.bot && !this.config.allowedBotIds?.includes(message.author.id)) return;
 
 		// Only process messages after startup (ignore cached/old messages replayed on reconnect)
 		if (message.createdTimestamp < this.startupTs) {
@@ -209,8 +211,35 @@ export class DiscordBot {
 			return;
 		}
 
+		// Only respond to human messages when directly addressed (DM or @mention).
+		// Allowlisted bots (e.g. Sentry) always pass through — they post alerts, not chat.
+		if (!message.author.bot) {
+			const isDM = message.channel.isDMBased();
+			const isMention = message.mentions.users.has(this.botUserId);
+			if (!isDM && !isMention) return;
+		}
+
 		const channelId = message.channelId;
-		const text = message.content.trim();
+		// Strip the bot's own mention so `@bob stop` matches the stop command and the agent
+		// doesn't see its own mention in the prompt. Other user mentions are preserved.
+		let text = message.content.replace(new RegExp(`<@!?${this.botUserId}>`, "g"), "").trim();
+
+		// For allowlisted bots (e.g. Sentry), extract embed content since message.content is often empty
+		if (!text && message.author.bot && message.embeds.length > 0) {
+			const embed = message.embeds[0];
+			const parts: string[] = [];
+			if (embed.title) parts.push(`Title: ${embed.title}`);
+			if (embed.description) parts.push(`Description: ${embed.description}`);
+			if (embed.url) parts.push(`URL: ${embed.url}`);
+			for (const field of embed.fields) {
+				parts.push(`${field.name}: ${field.value}`);
+			}
+			if (embed.footer?.text) parts.push(`Source: ${embed.footer.text}`);
+			text = parts.join("\n");
+		}
+
+		// Skip if still no content
+		if (!text) return;
 
 		// Log the user message to log.jsonl
 		this.logUserMessage(channelId, message);
@@ -239,19 +268,22 @@ export class DiscordBot {
 		}
 
 		this.getQueue(channelId).enqueue(async () => {
-			await this.handleAgentRun(message, state);
+			await this.handleAgentRun(message, state, text);
 		});
 	}
 
-	private async handleAgentRun(message: Message, state: ChannelState): Promise<void> {
+	private async handleAgentRun(message: Message, state: ChannelState, resolvedText: string): Promise<void> {
 		state.running = true;
 		state.stopRequested = false;
 
 		const channelId = message.channelId;
-		log.logInfo(`[${channelId}] Starting run: ${message.content.substring(0, 50)}`);
+		log.logInfo(`[${channelId}] Starting run: ${resolvedText.substring(0, 50)}`);
 
 		try {
 			const ctx = createDiscordContext(message, this.workingDir);
+			// Override text with resolved content (includes embed data for bot messages)
+			ctx.message.text = resolvedText;
+			ctx.message.rawText = resolvedText;
 
 			await ctx.setTyping(true);
 			await ctx.setWorking(true);
