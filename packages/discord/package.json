@@ -27,12 +27,15 @@
 		"chalk": "^5.6.2",
 		"croner": "^9.1.0",
 		"diff": "^8.0.2",
-		"discord.js": "^14.18.0"
+		"discord.js": "^14.18.0",
+		"duck-duck-scrape": "^2.2.7",
+		"playwright": "^1.58.2"
 	},
 	"devDependencies": {
 		"@types/node": "^24.3.0",
 		"shx": "^0.4.0",
-		"typescript": "^5.7.3"
+		"typescript": "^5.7.3",
+		"vitest": "^3.2.4"
 	},
 	"keywords": [
 		"discord",

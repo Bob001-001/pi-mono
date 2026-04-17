@@ -24,6 +24,8 @@ export interface DiscordConfig {
 		fallback?: ModelConfig;
 		fallbackTrigger?: FallbackTrigger;
 	};
+	/** Bot IDs whose messages should NOT be ignored (e.g. Sentry alert bot) */
+	allowedBotIds?: string[];
 	observability?: {
 		logLevel?: string;
 		metricsEnabled?: boolean;
