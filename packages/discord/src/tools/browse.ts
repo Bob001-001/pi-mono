@@ -84,12 +84,15 @@ async function ensureBrowser(profileDir: string): Promise<{ context: any; page: 
 
 	const pw = await import("playwright");
 
-	// Use real system Chrome (not Playwright's bundled Chromium) with a persistent
-	// profile. This makes the browser indistinguishable from a human's — real
-	// fingerprint, real codec support, real extensions directory, persistent cookies.
+	// Headful Chrome requires an active graphical session. Agents launched as
+	// background daemons (launchd, systemd without a display, etc.) have none
+	// and Chrome will fail to start. Set BROWSE_HEADLESS=true in those
+	// environments; interactive dev keeps headful by default.
+	const headless = process.env.BROWSE_HEADLESS === "true";
+
 	contextInstance = await pw.chromium.launchPersistentContext(profileDir, {
 		channel: "chrome",
-		headless: false,
+		headless,
 		args: ["--no-first-run", "--no-default-browser-check", "--disable-blink-features=AutomationControlled"],
 		ignoreDefaultArgs: ["--enable-automation"],
 		viewport: { width: 1280, height: 800 },
