@@ -364,7 +364,12 @@ function createRunner(config: DiscordConfig, channelId: string, channelDir: stri
 	const authStorage = AuthStorage.create(join(homedir(), ".pi", "discord", "auth.json"));
 	const modelRegistry = new ModelRegistry(authStorage);
 
-	// Resolve model from registry (includes custom models.json)
+	// Resolve model from registry (includes custom models.json). On miss we
+	// fall back to a known-good built-in so the bot stays alive (an unstartable
+	// runner would brick every channel until config is fixed by hand). The
+	// fallback is logged loudly so it shows up in stderr; the /model command
+	// also pre-validates against the built-in catalog to catch typos before
+	// they reach this path.
 	const provider = config.model.primary.api;
 	const modelId = config.model.primary.id;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any

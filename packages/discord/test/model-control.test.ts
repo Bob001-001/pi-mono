@@ -1,12 +1,14 @@
-import { describe, expect, it, beforeEach } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "fs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
 	atomicConfigUpdate,
 	formatCostRate,
+	hasInteractionBeenSeen,
 	isDuplicateInteraction,
 	logSwitchEvent,
+	markInteractionSeen,
 	MODEL_ALIASES,
 	modelAutocompleteChoices,
 	resolveAliasOrId,
@@ -97,11 +99,7 @@ describe("thinkingAutocompleteChoices", () => {
 	});
 });
 
-describe("isDuplicateInteraction", () => {
-	beforeEach(() => {
-		// State is module-level; use unique IDs per test to avoid cross-test pollution.
-	});
-
+describe("isDuplicateInteraction (legacy combined check+mark)", () => {
 	it("returns false for a new id, true on second call", () => {
 		const id = `unique-${Date.now()}-${Math.random()}`;
 		expect(isDuplicateInteraction(id)).toBe(false);
@@ -109,13 +107,31 @@ describe("isDuplicateInteraction", () => {
 	});
 
 	it("evicts old ids after the buffer fills", () => {
-		// Insert 70 unique ids (buffer size is 64); the first ones should be evicted.
 		const ids = Array.from({ length: 70 }, (_, i) => `evict-${Date.now()}-${i}`);
 		for (const id of ids) {
 			expect(isDuplicateInteraction(id)).toBe(false);
 		}
 		// First few should be evicted (buffer capped at 64).
 		expect(isDuplicateInteraction(ids[0])).toBe(false);
+	});
+});
+
+describe("hasInteractionBeenSeen + markInteractionSeen (split API)", () => {
+	it("hasInteractionBeenSeen does NOT mark — only checks", () => {
+		const id = `split-${Date.now()}-${Math.random()}`;
+		expect(hasInteractionBeenSeen(id)).toBe(false);
+		// Repeated checks still return false until explicitly marked.
+		expect(hasInteractionBeenSeen(id)).toBe(false);
+		markInteractionSeen(id);
+		expect(hasInteractionBeenSeen(id)).toBe(true);
+	});
+
+	it("markInteractionSeen is idempotent", () => {
+		const id = `idempotent-${Date.now()}-${Math.random()}`;
+		markInteractionSeen(id);
+		markInteractionSeen(id);
+		markInteractionSeen(id);
+		expect(hasInteractionBeenSeen(id)).toBe(true);
 	});
 });
 
@@ -137,6 +153,14 @@ describe("atomicConfigUpdate", () => {
 		tmpDir = mkdtempSync(join(tmpdir(), "discord-cfg-"));
 		configPath = join(tmpDir, "config.json");
 		writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+	});
+
+	afterEach(() => {
+		try {
+			rmSync(tmpDir, { recursive: true, force: true });
+		} catch {
+			// ignore
+		}
 	});
 
 	it("applies a single mutation and persists to disk", async () => {
@@ -167,7 +191,6 @@ describe("atomicConfigUpdate", () => {
 	});
 
 	it("serializes concurrent updates so neither is lost", async () => {
-		// Fire two updates that touch different fields. Without serialization, one would clobber.
 		await Promise.all([
 			atomicConfigUpdate(configPath, (cfg) => {
 				cfg.model.primary = { api: "anthropic", id: "claude-opus-4-7" };
@@ -179,29 +202,56 @@ describe("atomicConfigUpdate", () => {
 			}),
 		]);
 		const onDisk = JSON.parse(readFileSync(configPath, "utf-8"));
-		// Both fields should survive — serialization guarantees the second update
-		// reads the first's result, not the original.
 		expect(onDisk.model.primary.id).toBe("claude-opus-4-7");
 		expect(onDisk.model.thinkingLevel).toBe("medium");
 	});
 
 	it("does not leave a temp file behind on success", async () => {
 		await atomicConfigUpdate(configPath, (cfg) => cfg);
-		// No .tmp.* siblings should remain
-		const fs = await import("fs");
-		const siblings = fs.readdirSync(tmpDir);
-		const tmps = siblings.filter((f) => f.includes(".tmp."));
+		const tmps = readdirSync(tmpDir).filter((f) => f.includes(".tmp."));
 		expect(tmps).toEqual([]);
 	});
 
-	afterEach();
-	function afterEach() {
-		try {
-			rmSync(tmpDir, { recursive: true, force: true });
-		} catch {
-			// ignore
-		}
-	}
+	it("rejects writes that would produce an invalid config", async () => {
+		await expect(
+			atomicConfigUpdate(configPath, (cfg) => {
+				// Strip the required field — should be rejected, file should NOT change.
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				delete (cfg as any).discordOwnerId;
+				return cfg;
+			}),
+		).rejects.toThrow(/discordOwnerId/);
+		// Original file unchanged.
+		const onDisk = JSON.parse(readFileSync(configPath, "utf-8"));
+		expect(onDisk.discordOwnerId).toBe("123");
+	});
+
+	it("cleans up the temp file when a write fails (validation rejection)", async () => {
+		await expect(
+			atomicConfigUpdate(configPath, (cfg) => {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				delete (cfg as any).discordOwnerId;
+				return cfg;
+			}),
+		).rejects.toThrow();
+		const tmps = readdirSync(tmpDir).filter((f) => f.includes(".tmp."));
+		expect(tmps).toEqual([]);
+	});
+
+	it("refuses to write through a symlink", async () => {
+		const fs = await import("fs");
+		const symlinkPath = join(tmpDir, "config-link.json");
+		fs.symlinkSync(configPath, symlinkPath);
+		await expect(
+			atomicConfigUpdate(symlinkPath, (cfg) => {
+				cfg.model.primary = { api: "anthropic", id: "claude-opus-4-7" };
+				return cfg;
+			}),
+		).rejects.toThrow(/symlink/);
+		// Underlying file unchanged.
+		const onDisk = JSON.parse(readFileSync(configPath, "utf-8"));
+		expect(onDisk.model.primary.id).toBe("claude-sonnet-4-6");
+	});
 });
 
 describe("logSwitchEvent", () => {
@@ -209,8 +259,15 @@ describe("logSwitchEvent", () => {
 	beforeEach(() => {
 		tmpDir = mkdtempSync(join(tmpdir(), "discord-log-"));
 	});
+	afterEach(() => {
+		try {
+			rmSync(tmpDir, { recursive: true, force: true });
+		} catch {
+			// ignore
+		}
+	});
 
-	it("creates the logs directory if missing and writes a JSONL line", () => {
+	it("creates the logs directory if missing, writes a JSONL line, and returns true", () => {
 		const event: SwitchEvent = {
 			ts: "2026-05-02T10:00:00Z",
 			type: "model",
@@ -223,7 +280,7 @@ describe("logSwitchEvent", () => {
 			triggered_by: "manual",
 			next_message_id: null,
 		};
-		logSwitchEvent(tmpDir, event);
+		expect(logSwitchEvent(tmpDir, event)).toBe(true);
 		const logPath = join(tmpDir, "logs", "model-switches.jsonl");
 		expect(existsSync(logPath)).toBe(true);
 		const content = readFileSync(logPath, "utf-8").trim();
@@ -244,8 +301,8 @@ describe("logSwitchEvent", () => {
 			next_message_id: null,
 		};
 		const e2: SwitchEvent = { ...e1, ts: "2026-05-02T10:00:05Z", type: "thinking", thinking_after: "high" };
-		logSwitchEvent(tmpDir, e1);
-		logSwitchEvent(tmpDir, e2);
+		expect(logSwitchEvent(tmpDir, e1)).toBe(true);
+		expect(logSwitchEvent(tmpDir, e2)).toBe(true);
 		const content = readFileSync(join(tmpDir, "logs", "model-switches.jsonl"), "utf-8").trim();
 		const lines = content.split("\n");
 		expect(lines.length).toBe(2);
@@ -268,5 +325,20 @@ describe("formatCostRate", () => {
 		const model = resolveModelStrict("anthropic", "claude-sonnet-4-6");
 		const out = formatCostRate(model!, { inputTokens: 0, outputTokens: 0, totalCostUsd: 0 });
 		expect(out).toMatch(/no usage yet/);
+	});
+
+	it("renders sub-dollar rates without truncation (defensive vs old toFixed(0))", () => {
+		// Synthesize a fake model with sub-dollar pricing to exercise the format
+		// path. The actual built-in haiku-4-5 happens to be priced at exactly $1
+		// per MTok, so we use a fake to verify the formatter doesn't truncate.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const fake = {
+			id: "fake-cheap",
+			name: "Fake Cheap",
+			cost: { input: 0.8, output: 4 },
+		} as any;
+		const out = formatCostRate(fake, { inputTokens: 0, outputTokens: 0, totalCostUsd: 0 });
+		expect(out).toMatch(/\$0\.8 in/);
+		expect(out).toMatch(/\$4 out/);
 	});
 });
