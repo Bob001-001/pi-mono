@@ -1,20 +1,20 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	atomicConfigUpdate,
 	formatCostRate,
 	hasInteractionBeenSeen,
 	isDuplicateInteraction,
 	logSwitchEvent,
-	markInteractionSeen,
 	MODEL_ALIASES,
+	markInteractionSeen,
 	modelAutocompleteChoices,
 	resolveAliasOrId,
 	resolveModelStrict,
-	thinkingAutocompleteChoices,
 	type SwitchEvent,
+	thinkingAutocompleteChoices,
 } from "../src/model-control.js";
 
 describe("resolveAliasOrId", () => {

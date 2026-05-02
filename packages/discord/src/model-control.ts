@@ -4,9 +4,18 @@
 // ============================================================================
 
 import { getModel, type Model, type Provider } from "@mariozechner/pi-ai";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync, unlinkSync } from "fs";
-import { appendFileSync } from "fs";
 import { randomBytes } from "crypto";
+import {
+	appendFileSync,
+	closeSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeSync,
+} from "fs";
 import { dirname, join } from "path";
 import type { DiscordConfig, ModelConfig, ThinkingLevel } from "./config.js";
 import { validateConfig } from "./config.js";
@@ -178,7 +187,10 @@ export async function atomicConfigUpdate(
 					closeSync(dfd);
 				}
 			} catch (err) {
-				log.logWarning("atomicConfigUpdate: dir fsync failed (non-fatal)", err instanceof Error ? err.message : String(err));
+				log.logWarning(
+					"atomicConfigUpdate: dir fsync failed (non-fatal)",
+					err instanceof Error ? err.message : String(err),
+				);
 			}
 			result = updated;
 		} catch (err) {

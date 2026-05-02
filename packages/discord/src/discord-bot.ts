@@ -27,8 +27,8 @@ import {
 	formatCostRate,
 	hasInteractionBeenSeen,
 	logSwitchEvent,
-	markInteractionSeen,
 	MODEL_ALIASES,
+	markInteractionSeen,
 	modelAutocompleteChoices,
 	resolveAliasOrId,
 	resolveModelStrict,
@@ -650,10 +650,7 @@ export class DiscordBot {
 			const telemetryOk = logSwitchEvent(this.workingDir, event);
 
 			const newAlias = aliasNameForId(resolved.id) ?? resolved.id;
-			const replyLines = [
-				`**Switched model:** ${currentLabel} → **${newAlias}** (${resolved.id})`,
-				"",
-			];
+			const replyLines = [`**Switched model:** ${currentLabel} → **${newAlias}** (${resolved.id})`, ""];
 			if (model) {
 				replyLines.push(
 					formatCostRate(model, {
