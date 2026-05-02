@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import type { DiscordConfig, ModelConfig } from "./config.js";
+import type { DiscordConfig, ModelConfig, ThinkingLevel } from "./config.js";
 import { createDiscordSettingsManager, syncLogToSessionManager } from "./context.js";
 import type { DiscordContext } from "./discord-context.js";
 import * as log from "./log.js";
@@ -311,19 +311,24 @@ export function getOrCreateRunner(config: DiscordConfig, channelId: string, chan
 }
 
 /**
- * Replace the runner for a channel (used for model fallback).
+ * Replace the runner for a channel. Used for model fallback (auth-error path)
+ * and for user-driven /model and /thinking commands.
+ *
+ * Pass `modelOverride` to swap the primary model. Pass `thinkingOverride`
+ * to swap the thinking level. Pass both to swap both atomically.
  */
 export function replaceRunner(
 	config: DiscordConfig,
 	channelId: string,
 	channelDir: string,
-	modelOverride: ModelConfig,
+	overrides: { modelOverride?: ModelConfig; thinkingOverride?: ThinkingLevel },
 ): AgentRunner {
 	const configWithOverride: DiscordConfig = {
 		...config,
 		model: {
 			...config.model,
-			primary: modelOverride,
+			primary: overrides.modelOverride ?? config.model.primary,
+			thinkingLevel: overrides.thinkingOverride ?? config.model.thinkingLevel,
 		},
 	};
 	const runner = createRunner(configWithOverride, channelId, channelDir);
@@ -333,6 +338,16 @@ export function replaceRunner(
 
 export function getRunnerCount(): number {
 	return channelRunners.size;
+}
+
+/** Iterate (channelId, AgentRunner) entries. Snapshot — safe to mutate map during iteration. */
+export function getAllChannelEntries(): [string, AgentRunner][] {
+	return Array.from(channelRunners.entries());
+}
+
+/** Look up a runner by channel ID without creating one. */
+export function getRunnerForChannel(channelId: string): AgentRunner | undefined {
+	return channelRunners.get(channelId);
 }
 
 function createRunner(config: DiscordConfig, channelId: string, channelDir: string): AgentRunner {
@@ -353,7 +368,16 @@ function createRunner(config: DiscordConfig, channelId: string, channelDir: stri
 	const provider = config.model.primary.api;
 	const modelId = config.model.primary.id;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const model: Model<any> = modelRegistry.find(provider, modelId) ?? getModel("anthropic", "claude-sonnet-4-5");
+	const resolved = modelRegistry.find(provider, modelId) as Model<any> | undefined;
+	if (!resolved) {
+		log.logWarning(
+			"createRunner: model not found in registry; falling back to claude-sonnet-4-5",
+			`requested ${provider}/${modelId}`,
+		);
+	}
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const model: Model<any> = resolved ?? getModel("anthropic", "claude-sonnet-4-5");
+	const thinkingLevel: ThinkingLevel = config.model.thinkingLevel ?? "off";
 
 	const contextFile = join(channelDir, "context.jsonl");
 	const sessionManager = SessionManager.open(contextFile, channelDir);
@@ -363,7 +387,7 @@ function createRunner(config: DiscordConfig, channelId: string, channelDir: stri
 		initialState: {
 			systemPrompt,
 			model,
-			thinkingLevel: "off",
+			thinkingLevel,
 			tools,
 		},
 		convertToLlm: (messages) => {

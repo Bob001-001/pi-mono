@@ -37,10 +37,12 @@ function parseArgs(): { configPath: string } {
 					token: "YOUR_DISCORD_BOT_TOKEN",
 					agentName: "elon",
 					workspaceDir: "/Users/elon/.pi/workspace",
+					discordOwnerId: "YOUR_DISCORD_USER_ID",
 					model: {
-						primary: { api: "anthropic", id: "claude-sonnet-4-5" },
+						primary: { api: "anthropic", id: "claude-sonnet-4-6" },
 						fallback: { api: "anthropic", id: "claude-haiku-4-5" },
 						fallbackTrigger: { authError: true, consecutiveTimeouts: 3 },
+						thinkingLevel: "off",
 					},
 					observability: {
 						logLevel: "info",
@@ -84,9 +86,11 @@ log.logInfo(`Config loaded from ${configPath}`);
 log.logInfo(`Agent: ${config.agentName}`);
 log.logInfo(`Workspace: ${config.workspaceDir}`);
 log.logInfo(`Model: ${config.model.primary.api}/${config.model.primary.id}`);
+log.logInfo(`Thinking level: ${config.model.thinkingLevel ?? "off"}`);
+log.logInfo(`Owner: ${config.discordOwnerId}`);
 
 // Create and start the bot
-const bot = new DiscordBot(config);
+const bot = new DiscordBot(config, configPath);
 
 // Start events watcher
 const eventsWatcher = createEventsWatcher(config.workspaceDir, bot);
