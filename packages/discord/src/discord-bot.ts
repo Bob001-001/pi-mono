@@ -608,10 +608,14 @@ export class DiscordBot {
 
 			let swappedChannels: string[];
 			try {
-				this.config = await atomicConfigUpdate(this.configPath, (cfg) => {
-					cfg.model = { ...cfg.model, primary: { api: resolved.api, id: resolved.id } };
-					return cfg;
-				});
+				this.config = await atomicConfigUpdate(
+					this.configPath,
+					(cfg) => {
+						cfg.model = { ...cfg.model, primary: { api: resolved.api, id: resolved.id } };
+						return cfg;
+					},
+					{ backupDir: join(this.workingDir, "logs", "config-backups") },
+				);
 			} catch (err) {
 				log.logWarning("/model: atomicConfigUpdate failed", err instanceof Error ? err.message : String(err));
 				await interaction.editReply({
@@ -728,10 +732,14 @@ export class DiscordBot {
 			}
 
 			try {
-				this.config = await atomicConfigUpdate(this.configPath, (cfg) => {
-					cfg.model = { ...cfg.model, thinkingLevel: normalized };
-					return cfg;
-				});
+				this.config = await atomicConfigUpdate(
+					this.configPath,
+					(cfg) => {
+						cfg.model = { ...cfg.model, thinkingLevel: normalized };
+						return cfg;
+					},
+					{ backupDir: join(this.workingDir, "logs", "config-backups") },
+				);
 			} catch (err) {
 				log.logWarning("/thinking: atomicConfigUpdate failed", err instanceof Error ? err.message : String(err));
 				await interaction.editReply({

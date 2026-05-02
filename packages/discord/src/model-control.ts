@@ -5,18 +5,8 @@
 
 import { getModel, type Model, type Provider } from "@mariozechner/pi-ai";
 import { randomBytes } from "crypto";
-import {
-	appendFileSync,
-	closeSync,
-	fsyncSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	unlinkSync,
-	writeSync,
-} from "fs";
-import { dirname, join } from "path";
+import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "fs";
+import { join } from "path";
 import type { DiscordConfig, ModelConfig, ThinkingLevel } from "./config.js";
 import { validateConfig } from "./config.js";
 import * as log from "./log.js";
@@ -121,31 +111,49 @@ export function formatCostRate(model: Model<Provider>, currentSnapshot: SessionC
 }
 
 // ----------------------------------------------------------------------------
-// Atomic config write with process-level mutex.
+// In-place config write with process-level mutex.
+//
+// The pi-agent security model puts the agent's home `.pi/` directory under
+// `root:wheel 755` so the agent (running as a separate OS user) cannot
+// tamper with its own runtime. The config file `~/.pi/config.json` itself
+// is `<agent>:staff 600` — the agent can read AND write the file directly,
+// but it CANNOT create sibling files in the parent dir. That kills the
+// classic temp+rename atomicity pattern (rename needs write on the
+// destination dir).
+//
+// So we write in place: open(O_WRONLY|O_TRUNC) → writeSync → fsyncSync →
+// closeSync. For a config of ~1KB, the writeSync is a single syscall and
+// is effectively atomic at the kernel level (won't be torn). The narrow
+// risk window is SIGKILL between truncate and writeSync returning — the
+// file would be truncated to 0 bytes. Mitigations:
+// - We snapshot the previous content into a backup file under the agent's
+//   writable workspace BEFORE the truncate. On next bot startup, if config
+//   is unparseable, the operator can recover from this backup.
+// - The bot is a single long-lived process; SIGKILL between truncate and
+//   write is improbable.
+// - validateConfig runs before the write, so a bad mutation never reaches
+//   disk.
 // ----------------------------------------------------------------------------
 
 let _writeChain: Promise<void> = Promise.resolve();
 
 /**
- * Atomically apply an in-place mutation to the config file. Serializes against
- * concurrent calls IN THE SAME PROCESS. Writes to a temp file then renames
- * (atomic on the same filesystem). Re-validates the result before writing
- * so a hand-edited bad config doesn't get re-serialized.
+ * Apply an in-place mutation to the config file. Serializes against concurrent
+ * calls IN THE SAME PROCESS. Re-validates the result before writing.
  *
  * Caveats:
- * - This mutex is process-local. If another process (e.g. `deploy.sh`) writes
- *   to the same file concurrently, the last writer wins. The bot's contract
- *   is that nothing else should write `model.*` while it's running. The deploy
- *   script preserves the live config when it has a real token, so in practice
- *   the only writer is the bot itself.
- * - We refuse symlinks (security: prevents redirecting writes outside .pi/).
- * - On crash mid-write, the temp file is unlinked in the finally block. If
- *   the process is hard-killed, an orphan temp may remain — name includes pid
- *   and 32-bit random so multiple orphans don't collide on cleanup.
+ * - Process-local mutex only. Another process writing the same file
+ *   concurrently can clobber. The bot's contract is that nothing else
+ *   writes `model.*` while it runs.
+ * - Refuses symlinks (security: prevents redirecting writes outside .pi/).
+ * - If `options.backupDir` is provided, the previous content is saved
+ *   there before the truncate-and-write. Older backups are pruned to keep
+ *   the 10 most recent.
  */
 export async function atomicConfigUpdate(
 	configPath: string,
 	apply: (config: DiscordConfig) => DiscordConfig,
+	options?: { backupDir?: string },
 ): Promise<DiscordConfig> {
 	let result!: DiscordConfig;
 	const next = _writeChain.then(async () => {
@@ -163,49 +171,57 @@ export async function atomicConfigUpdate(
 		// doesn't get persisted.
 		validateConfig(updated);
 
-		const serialized = `${JSON.stringify(updated, null, 2)}\n`;
-		const tmpSuffix = `${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}`;
-		const tmpPath = `${configPath}.tmp.${tmpSuffix}`;
-		const dir = dirname(configPath);
-
-		let fd: number | null = null;
-		try {
-			fd = openSync(tmpPath, "w", 0o600);
-			writeSync(fd, serialized);
-			fsyncSync(fd); // durably persist the temp file's data
-			closeSync(fd);
-			fd = null;
-			renameSync(tmpPath, configPath);
-			// fsync the parent dir to durably persist the rename's metadata.
-			// On filesystems that don't support dir fsync (rare on macOS HFS+/APFS)
-			// this throws EPERM/EINVAL — non-fatal, log and continue.
+		// Backup current content to a writable location BEFORE truncate.
+		if (options?.backupDir) {
 			try {
-				const dfd = openSync(dir, "r");
+				mkdirSync(options.backupDir, { recursive: true });
+				const stamp = `${Date.now()}.${randomBytes(4).toString("hex")}`;
+				const backupPath = join(options.backupDir, `config.json.bak-${stamp}`);
+				writeFileSync(backupPath, raw, { mode: 0o600 });
+				// Best-effort: prune older backups, keep the 10 most recent.
 				try {
-					fsyncSync(dfd);
-				} finally {
-					closeSync(dfd);
+					const entries = fs
+						.readdirSync(options.backupDir)
+						.filter((f) => f.startsWith("config.json.bak-"))
+						.sort();
+					while (entries.length > 10) {
+						const oldest = entries.shift()!;
+						try {
+							fs.unlinkSync(join(options.backupDir, oldest));
+						} catch {
+							/* ignore */
+						}
+					}
+				} catch {
+					/* ignore prune errors */
 				}
 			} catch (err) {
 				log.logWarning(
-					"atomicConfigUpdate: dir fsync failed (non-fatal)",
+					"atomicConfigUpdate: backup write failed (non-fatal)",
 					err instanceof Error ? err.message : String(err),
 				);
 			}
+		}
+
+		const serialized = `${JSON.stringify(updated, null, 2)}\n`;
+		// Open the actual config path with O_WRONLY|O_TRUNC. eva owns the file
+		// (mode 600) so this works even when the parent dir is root-owned 755
+		// (which would block any temp+rename approach).
+		let fd: number | null = null;
+		try {
+			fd = openSync(configPath, "w", 0o600);
+			writeSync(fd, serialized);
+			fsyncSync(fd);
+			closeSync(fd);
+			fd = null;
 			result = updated;
 		} catch (err) {
-			// Cleanup orphan temp file if anything failed.
 			if (fd !== null) {
 				try {
 					closeSync(fd);
 				} catch {
 					/* ignore */
 				}
-			}
-			try {
-				unlinkSync(tmpPath);
-			} catch {
-				/* ignore — may not exist */
 			}
 			throw err;
 		}

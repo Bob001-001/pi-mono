@@ -206,10 +206,43 @@ describe("atomicConfigUpdate", () => {
 		expect(onDisk.model.thinkingLevel).toBe("medium");
 	});
 
-	it("does not leave a temp file behind on success", async () => {
+	it("does not leave any sibling temp files behind (in-place write)", async () => {
 		await atomicConfigUpdate(configPath, (cfg) => cfg);
-		const tmps = readdirSync(tmpDir).filter((f) => f.includes(".tmp."));
-		expect(tmps).toEqual([]);
+		// No .tmp.* siblings should ever appear — we write in place now because
+		// the production env (root-owned parent dir) blocks sibling-file creation.
+		const siblings = readdirSync(tmpDir).filter((f) => f !== "config.json");
+		expect(siblings).toEqual([]);
+	});
+
+	it("writes a backup to backupDir when provided, prunes to 10 most recent", async () => {
+		const backupDir = join(tmpDir, "backups");
+		// Fire 12 updates — should leave exactly 10 backups.
+		for (let i = 0; i < 12; i++) {
+			await atomicConfigUpdate(
+				configPath,
+				(cfg) => {
+					cfg.model.thinkingLevel = i % 2 === 0 ? "high" : "off";
+					return cfg;
+				},
+				{ backupDir },
+			);
+		}
+		const backups = readdirSync(backupDir).filter((f) => f.startsWith("config.json.bak-"));
+		expect(backups.length).toBe(10);
+	});
+
+	it("recovers cleanly when backupDir doesn't exist (creates it)", async () => {
+		const backupDir = join(tmpDir, "deep", "nested", "backups");
+		await atomicConfigUpdate(
+			configPath,
+			(cfg) => {
+				cfg.model.thinkingLevel = "high";
+				return cfg;
+			},
+			{ backupDir },
+		);
+		const backups = readdirSync(backupDir).filter((f) => f.startsWith("config.json.bak-"));
+		expect(backups.length).toBe(1);
 	});
 
 	it("rejects writes that would produce an invalid config", async () => {
@@ -226,7 +259,8 @@ describe("atomicConfigUpdate", () => {
 		expect(onDisk.discordOwnerId).toBe("123");
 	});
 
-	it("cleans up the temp file when a write fails (validation rejection)", async () => {
+	it("leaves disk untouched when validation rejects", async () => {
+		const before = readFileSync(configPath, "utf-8");
 		await expect(
 			atomicConfigUpdate(configPath, (cfg) => {
 				// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -234,8 +268,9 @@ describe("atomicConfigUpdate", () => {
 				return cfg;
 			}),
 		).rejects.toThrow();
-		const tmps = readdirSync(tmpDir).filter((f) => f.includes(".tmp."));
-		expect(tmps).toEqual([]);
+		// File unchanged because validateConfig threw before the openSync(O_TRUNC).
+		const after = readFileSync(configPath, "utf-8");
+		expect(after).toBe(before);
 	});
 
 	it("refuses to write through a symlink", async () => {
