@@ -1,4 +1,6 @@
 import {
+	type AutocompleteInteraction,
+	type ChatInputCommandInteraction,
 	Client,
 	GatewayIntentBits,
 	type Interaction,
@@ -12,12 +14,27 @@ import {
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import type { AgentRunner } from "./agent.js";
-import { getOrCreateRunner, getRunnerCount } from "./agent.js";
-import type { DiscordConfig } from "./config.js";
+import { getAllChannelEntries, getOrCreateRunner, getRunnerCount, replaceRunner } from "./agent.js";
+import type { DiscordConfig, ThinkingLevel } from "./config.js";
+import { THINKING_LEVELS } from "./config.js";
 import { createDiscordContext } from "./discord-context.js";
 import type { SyntheticDiscordMessage } from "./events.js";
 import * as log from "./log.js";
 import { globalMetrics } from "./metrics.js";
+import {
+	aliasNameForId,
+	atomicConfigUpdate,
+	formatCostRate,
+	hasInteractionBeenSeen,
+	logSwitchEvent,
+	MODEL_ALIASES,
+	markInteractionSeen,
+	modelAutocompleteChoices,
+	resolveAliasOrId,
+	resolveModelStrict,
+	type SwitchEvent,
+	thinkingAutocompleteChoices,
+} from "./model-control.js";
 import { ChannelStore } from "./store.js";
 
 // ============================================================================
@@ -71,15 +88,25 @@ interface ChannelState {
 export class DiscordBot {
 	private client: Client;
 	private config: DiscordConfig;
+	private configPath: string;
 	private workingDir: string;
 	private queues = new Map<string, ChannelQueue>();
 	private channelStates = new Map<string, ChannelState>();
 	private botUserId: string | null = null;
 	private startupTs: number = 0;
 	private applicationId: string | null = null;
+	/**
+	 * Set true while a /model or /thinking swap is in progress. New runs
+	 * (messages or events) refuse to start while this is set, preventing
+	 * an in-flight LLM stream from being orphaned by `swapAllRunners()`.
+	 * The check + set is safe in JS (single-threaded) as long as the flip
+	 * happens synchronously before any await.
+	 */
+	private swapInProgress = false;
 
-	constructor(config: DiscordConfig) {
+	constructor(config: DiscordConfig, configPath: string) {
 		this.config = config;
+		this.configPath = configPath;
 		this.workingDir = config.workspaceDir;
 
 		this.client = new Client({
@@ -262,12 +289,22 @@ export class DiscordBot {
 
 		const state = this.getState(channelId);
 
+		if (this.swapInProgress) {
+			await message.reply("_Bot is reconfiguring (model/thinking swap). Try again in a few seconds._");
+			return;
+		}
+
 		if (state.running) {
 			await message.reply("_Already working. Say `stop` to cancel._");
 			return;
 		}
 
 		this.getQueue(channelId).enqueue(async () => {
+			// Re-check at dispatch time — a swap may have started while we waited in the queue.
+			if (this.swapInProgress) {
+				log.logInfo(`[${channelId}] Skipping queued run — swap in progress`);
+				return;
+			}
 			await this.handleAgentRun(message, state, text);
 		});
 	}
@@ -306,6 +343,11 @@ export class DiscordBot {
 	private async handleEventMessage(msg: SyntheticDiscordMessage): Promise<void> {
 		const channelId = msg.channelId;
 		const state = this.getState(channelId);
+
+		if (this.swapInProgress) {
+			log.logInfo(`[${channelId}] Skipping event run — swap in progress`);
+			return;
+		}
 
 		state.running = true;
 		state.stopRequested = false;
@@ -361,6 +403,21 @@ export class DiscordBot {
 				.setName("status")
 				.setDescription("Show bot health: uptime, messages, reconnections, queue depths, session count"),
 			new SlashCommandBuilder().setName("costs").setDescription("Show token usage summary"),
+			new SlashCommandBuilder()
+				.setName("whoami")
+				.setDescription("Show your Discord user ID (debug aid for owner-ID configuration)"),
+			new SlashCommandBuilder()
+				.setName("model")
+				.setDescription("Switch the primary model (DM-only, owner-only). No arg shows current.")
+				.addStringOption((opt) =>
+					opt.setName("name").setDescription("Alias (sonnet|opus|haiku) or exact model ID").setAutocomplete(true),
+				),
+			new SlashCommandBuilder()
+				.setName("thinking")
+				.setDescription("Switch the reasoning level (DM-only, owner-only). No arg shows current.")
+				.addStringOption((opt) =>
+					opt.setName("level").setDescription("off | low | medium | high").setAutocomplete(true),
+				),
 		];
 
 		try {
@@ -368,22 +425,430 @@ export class DiscordBot {
 			await rest.put(Routes.applicationCommands(this.applicationId), {
 				body: commands.map((c) => c.toJSON()),
 			});
-			log.logInfo("Slash commands registered: /status, /costs");
+			log.logInfo("Slash commands registered: /status, /costs, /whoami, /model, /thinking");
 		} catch (err) {
 			log.logWarning("Failed to register slash commands", err instanceof Error ? err.message : String(err));
 		}
 	}
 
 	private async handleInteraction(interaction: Interaction): Promise<void> {
-		if (!interaction.isChatInputCommand()) return;
-
-		if (interaction.commandName === "status") {
-			const statusText = globalMetrics.formatStatus(getRunnerCount());
-			await interaction.reply({ content: statusText, ephemeral: false });
-		} else if (interaction.commandName === "costs") {
-			const costsText = globalMetrics.formatCosts();
-			await interaction.reply({ content: costsText, ephemeral: false });
+		// Dedup CHECK only — mark after successful handling so a failed handler
+		// doesn't suppress Discord's retry.
+		if ("id" in interaction && hasInteractionBeenSeen(interaction.id)) {
+			log.logInfo(`Skipping duplicate interaction ${interaction.id}`);
+			return;
 		}
+
+		try {
+			if (interaction.isAutocomplete()) {
+				await this.handleAutocomplete(interaction);
+				if ("id" in interaction) markInteractionSeen(interaction.id);
+				return;
+			}
+
+			if (!interaction.isChatInputCommand()) return;
+
+			const name = interaction.commandName;
+
+			if (name === "status") {
+				await interaction.reply({ content: globalMetrics.formatStatus(getRunnerCount()), ephemeral: false });
+			} else if (name === "costs") {
+				await interaction.reply({ content: globalMetrics.formatCosts(), ephemeral: false });
+			} else if (name === "whoami") {
+				if (!this.isDmInteraction(interaction)) {
+					await interaction.reply({ content: "_/whoami only works in DMs._", ephemeral: true });
+				} else {
+					// Owner-gate the disclosure: non-owners only see their own ID.
+					// (Owner ID is not cryptographically secret, but it IS the trust
+					// boundary for /model and /thinking — don't leak it via /whoami.)
+					const isOwner = interaction.user.id === this.config.discordOwnerId;
+					const lines = [`Your Discord user ID: \`${interaction.user.id}\``];
+					if (isOwner) {
+						lines.push(`Configured owner: \`${this.config.discordOwnerId}\` ✅ (this is you)`);
+					} else {
+						lines.push(`You are not the configured owner of this bot.`);
+					}
+					await interaction.reply({ content: lines.join("\n"), ephemeral: true });
+				}
+			} else if (name === "model") {
+				await this.handleModelCommand(interaction);
+			} else if (name === "thinking") {
+				await this.handleThinkingCommand(interaction);
+			}
+
+			if ("id" in interaction) markInteractionSeen(interaction.id);
+		} catch (err) {
+			log.logWarning(
+				`handleInteraction error for ${interaction.isChatInputCommand() ? interaction.commandName : "unknown"}`,
+				err instanceof Error ? err.message : String(err),
+			);
+			// Mark seen even on error to avoid retry storms — the user-visible
+			// failure is in the reply, the dedup is just to stop runaway loops.
+			if ("id" in interaction) markInteractionSeen(interaction.id);
+		}
+	}
+
+	// ==========================================================================
+	// Slash command auth + autocomplete
+	// ==========================================================================
+
+	/**
+	 * DM detection: use `guildId === null` (bulletproof — DMs have no guild).
+	 * Avoids the `interaction.channel?.type === DM` pattern which can throw on
+	 * uncached DM channels.
+	 */
+	private isDmInteraction(interaction: ChatInputCommandInteraction | AutocompleteInteraction): boolean {
+		return interaction.guildId === null;
+	}
+
+	private isOwner(interaction: ChatInputCommandInteraction | AutocompleteInteraction): boolean {
+		return interaction.user.id === this.config.discordOwnerId;
+	}
+
+	/** Returns true if the interaction passes the DM-only + owner-only gate. */
+	private passesAuthGate(interaction: ChatInputCommandInteraction | AutocompleteInteraction): boolean {
+		return this.isDmInteraction(interaction) && this.isOwner(interaction);
+	}
+
+	private async handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
+		// Gate identically to the command — non-owners (or guild context) get an
+		// empty list, which Discord renders as "no matches". Better than leaking
+		// the model alias list outside the owner DM.
+		if (!this.passesAuthGate(interaction)) {
+			try {
+				await interaction.respond([]);
+			} catch {
+				// non-fatal
+			}
+			return;
+		}
+
+		const focused = interaction.options.getFocused(true);
+		try {
+			if (interaction.commandName === "model" && focused.name === "name") {
+				await interaction.respond(modelAutocompleteChoices(focused.value));
+			} else if (interaction.commandName === "thinking" && focused.name === "level") {
+				await interaction.respond(thinkingAutocompleteChoices(focused.value));
+			} else {
+				await interaction.respond([]);
+			}
+		} catch (err) {
+			log.logWarning("Autocomplete respond failed", err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	// ==========================================================================
+	// /model handler
+	// ==========================================================================
+
+	private async handleModelCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+		if (!this.passesAuthGate(interaction)) {
+			await interaction.reply({
+				content: "_This command is restricted to the configured owner in DMs only._",
+				ephemeral: true,
+			});
+			return;
+		}
+
+		const requested = interaction.options.getString("name");
+		const current = this.config.model.primary;
+		const currentAlias = aliasNameForId(current.id);
+		const currentLabel = currentAlias ? `${currentAlias} (${current.id})` : current.id;
+
+		// No arg → show current state.
+		if (!requested) {
+			const lines = [
+				`**Current model:** ${currentLabel}`,
+				`**Thinking level:** ${this.config.model.thinkingLevel ?? "off"}`,
+				"",
+				`Aliases: ${MODEL_ALIASES.map((a) => `\`${a.name}\` → ${a.id} (${a.tier})`).join(", ")}`,
+				"",
+				"Use `/thinking off|low|medium|high` to control reasoning depth independently.",
+			];
+			await interaction.reply({ content: lines.join("\n"), ephemeral: false });
+			return;
+		}
+
+		// Defer FIRST so we don't blow Discord's 3s deadline under load. All
+		// subsequent failures use editReply.
+		await interaction.deferReply({ ephemeral: false });
+
+		const resolved = resolveAliasOrId(requested);
+		if (!resolved) {
+			await interaction.editReply({ content: `_Empty model name._` });
+			return;
+		}
+
+		// Strict validation against built-in catalog. Custom-provider IDs from
+		// `models.json` are accepted (resolveModelStrict returns null) and
+		// validated at runner-creation time. For built-in IDs, refuse here so
+		// we don't lie about the swap.
+		const model = resolveModelStrict(resolved.api, resolved.id);
+		// If it's not in the built-in catalog, accept on faith but print a
+		// caveat (the runner will fail loudly if the ID is bogus).
+		const isBuiltin = model !== null;
+
+		// Acquire swap-in-progress lock and re-check no run is active.
+		// The flag must be flipped synchronously before the next await so
+		// concurrent message handlers see it.
+		if (this.swapInProgress) {
+			await interaction.editReply({ content: "_Another swap is already in progress. Try again in a moment._" });
+			return;
+		}
+		this.swapInProgress = true;
+		try {
+			const runningChannel = this.findRunningChannel();
+			if (runningChannel) {
+				const count = this.countRunningChannels();
+				await interaction.editReply({
+					content: `_${count} run${count === 1 ? "" : "s"} in progress (e.g. channel ${runningChannel}). Wait for them to finish, then retry._`,
+				});
+				return;
+			}
+
+			let swappedChannels: string[];
+			try {
+				this.config = await atomicConfigUpdate(
+					this.configPath,
+					(cfg) => {
+						cfg.model = { ...cfg.model, primary: { api: resolved.api, id: resolved.id } };
+						return cfg;
+					},
+					{ backupDir: join(this.workingDir, "logs", "config-backups") },
+				);
+			} catch (err) {
+				log.logWarning("/model: atomicConfigUpdate failed", err instanceof Error ? err.message : String(err));
+				await interaction.editReply({
+					content: `_Config write failed: ${err instanceof Error ? err.message : String(err)}_`,
+				});
+				return;
+			}
+
+			try {
+				swappedChannels = this.swapAllRunners();
+			} catch (err) {
+				log.logWarning("/model: swapAllRunners failed", err instanceof Error ? err.message : String(err));
+				await interaction.editReply({
+					content:
+						`_Config persisted but in-memory runner swap failed: ${err instanceof Error ? err.message : String(err)}_\n` +
+						"Restart the bot to pick up the new model.",
+				});
+				return;
+			}
+
+			// Telemetry: log the switch. Failures here are non-fatal but are
+			// surfaced to the user so they know adaptive-selection backfill
+			// will be missing this entry.
+			const event: SwitchEvent = {
+				ts: new Date().toISOString(),
+				type: "model",
+				model_before: current.id,
+				model_after: resolved.id,
+				thinking_before: this.config.model.thinkingLevel ?? "off",
+				thinking_after: this.config.model.thinkingLevel ?? "off",
+				channel_id: interaction.channelId ?? "unknown",
+				user_id: interaction.user.id,
+				triggered_by: "manual",
+				next_message_id: null,
+			};
+			const telemetryOk = logSwitchEvent(this.workingDir, event);
+
+			const newAlias = aliasNameForId(resolved.id) ?? resolved.id;
+			const replyLines = [`**Switched model:** ${currentLabel} → **${newAlias}** (${resolved.id})`, ""];
+			if (model) {
+				replyLines.push(
+					formatCostRate(model, {
+						inputTokens: globalMetrics.getMetrics().tokenUsage.input,
+						outputTokens: globalMetrics.getMetrics().tokenUsage.output,
+						totalCostUsd: globalMetrics.getMetrics().tokenUsage.totalCost,
+					}),
+					"",
+				);
+			} else if (!isBuiltin) {
+				replyLines.push(
+					`_Note: \`${resolved.id}\` is not a built-in model. Cost not shown. If the runner fails to start, your custom \`models.json\` may not have it registered._`,
+					"",
+				);
+			}
+			replyLines.push(`Active channel runners swapped: ${swappedChannels.length}.`);
+			if (!telemetryOk) {
+				replyLines.push("_Telemetry log failed (see bot logs)._");
+			}
+			replyLines.push("Use `/thinking off|low|medium|high` to control reasoning depth independently.");
+			await interaction.editReply({ content: replyLines.join("\n") });
+		} finally {
+			this.swapInProgress = false;
+		}
+	}
+
+	// ==========================================================================
+	// /thinking handler
+	// ==========================================================================
+
+	private async handleThinkingCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+		if (!this.passesAuthGate(interaction)) {
+			await interaction.reply({
+				content: "_This command is restricted to the configured owner in DMs only._",
+				ephemeral: true,
+			});
+			return;
+		}
+
+		const requested = interaction.options.getString("level");
+		const currentLevel = this.config.model.thinkingLevel ?? "off";
+
+		if (!requested) {
+			await interaction.reply({
+				content: `**Current thinking level:** ${currentLevel}\nValid: ${THINKING_LEVELS.join(", ")}.\nUse \`/model\` to swap the model itself.`,
+				ephemeral: false,
+			});
+			return;
+		}
+
+		// Defer FIRST so we don't blow Discord's 3s deadline.
+		await interaction.deferReply({ ephemeral: false });
+
+		const normalized = requested.trim().toLowerCase() as ThinkingLevel;
+		if (!THINKING_LEVELS.includes(normalized)) {
+			await interaction.editReply({
+				content: `_Unknown level \`${requested}\`._ Valid: ${THINKING_LEVELS.join(", ")}.`,
+			});
+			return;
+		}
+
+		if (this.swapInProgress) {
+			await interaction.editReply({ content: "_Another swap is already in progress. Try again in a moment._" });
+			return;
+		}
+		this.swapInProgress = true;
+		try {
+			const runningChannel = this.findRunningChannel();
+			if (runningChannel) {
+				const count = this.countRunningChannels();
+				await interaction.editReply({
+					content: `_${count} run${count === 1 ? "" : "s"} in progress (e.g. channel ${runningChannel}). Wait for them to finish, then retry._`,
+				});
+				return;
+			}
+
+			try {
+				this.config = await atomicConfigUpdate(
+					this.configPath,
+					(cfg) => {
+						cfg.model = { ...cfg.model, thinkingLevel: normalized };
+						return cfg;
+					},
+					{ backupDir: join(this.workingDir, "logs", "config-backups") },
+				);
+			} catch (err) {
+				log.logWarning("/thinking: atomicConfigUpdate failed", err instanceof Error ? err.message : String(err));
+				await interaction.editReply({
+					content: `_Config write failed: ${err instanceof Error ? err.message : String(err)}_`,
+				});
+				return;
+			}
+
+			let swappedChannels: string[];
+			try {
+				swappedChannels = this.swapAllRunners();
+			} catch (err) {
+				log.logWarning("/thinking: swapAllRunners failed", err instanceof Error ? err.message : String(err));
+				await interaction.editReply({
+					content:
+						`_Config persisted but in-memory runner swap failed: ${err instanceof Error ? err.message : String(err)}_\n` +
+						"Restart the bot to pick up the new thinking level.",
+				});
+				return;
+			}
+
+			const event: SwitchEvent = {
+				ts: new Date().toISOString(),
+				type: "thinking",
+				model_before: this.config.model.primary.id,
+				model_after: this.config.model.primary.id,
+				thinking_before: currentLevel,
+				thinking_after: normalized,
+				channel_id: interaction.channelId ?? "unknown",
+				user_id: interaction.user.id,
+				triggered_by: "manual",
+				next_message_id: null,
+			};
+			const telemetryOk = logSwitchEvent(this.workingDir, event);
+
+			const lines = [
+				`**Switched thinking:** ${currentLevel} → **${normalized}** (was: ${currentLevel})`,
+				`Active channel runners swapped: ${swappedChannels.length}.`,
+			];
+			if (!telemetryOk) lines.push("_Telemetry log failed (see bot logs)._");
+			lines.push("Use `/model` to swap the model itself.");
+			await interaction.editReply({ content: lines.join("\n") });
+		} finally {
+			this.swapInProgress = false;
+		}
+	}
+
+	// ==========================================================================
+	// Runner-swap plumbing — fixes the dual-map staleness bug.
+	// ==========================================================================
+
+	/** Returns the channelId of any in-progress run, or null if all idle. */
+	private findRunningChannel(): string | null {
+		for (const [channelId, state] of this.channelStates) {
+			if (state.running) return channelId;
+		}
+		return null;
+	}
+
+	/** Count how many channels are mid-run. Used in error messages. */
+	private countRunningChannels(): number {
+		let n = 0;
+		for (const [, state] of this.channelStates) {
+			if (state.running) n++;
+		}
+		return n;
+	}
+
+	/**
+	 * For every channel that has either a cached runner OR a state, build a
+	 * new runner from the current config and reassign both the module-level
+	 * `channelRunners` map AND the per-channel `state.runner` reference.
+	 * Iterating the union (not just channelRunners) is defensive: it guarantees
+	 * we don't miss a state whose runner pointer is somehow out of sync.
+	 *
+	 * Old runners are aborted before being replaced. The refuse-while-running
+	 * gate in /model and /thinking ensures none of them are mid-stream when
+	 * abort() is called, so this is safe.
+	 *
+	 * Throws if any individual swap throws — caller handles cleanup.
+	 */
+	private swapAllRunners(): string[] {
+		const moduleChannelIds = new Set(getAllChannelEntries().map(([id]) => id));
+		const stateChannelIds = new Set(this.channelStates.keys());
+		const allChannelIds = new Set([...moduleChannelIds, ...stateChannelIds]);
+
+		const swapped: string[] = [];
+		for (const channelId of allChannelIds) {
+			const oldState = this.channelStates.get(channelId);
+			// Abort the old runner if we can. Refuse-while-running guarantees it
+			// isn't mid-stream, but abort is still the right cleanup signal for
+			// any pending events.
+			try {
+				oldState?.runner.abort();
+			} catch (err) {
+				log.logWarning(
+					`swapAllRunners: oldRunner.abort threw for ${channelId}`,
+					err instanceof Error ? err.message : String(err),
+				);
+			}
+
+			const channelDir = join(this.workingDir, channelId);
+			const newRunner = replaceRunner(this.config, channelId, channelDir, {});
+			if (oldState) {
+				oldState.runner = newRunner;
+			}
+			swapped.push(channelId);
+		}
+		return swapped;
 	}
 
 	// ==========================================================================
